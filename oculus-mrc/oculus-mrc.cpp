@@ -20,16 +20,29 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 #include <fcntl.h>  
 #include <sys/types.h>  
-#include <sys/stat.h>  
-#include <io.h>  
+#include <sys/stat.h>
+#if _WIN32
+    #include <io.h>
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+#else
+    /* Assume that any non-Windows platform uses POSIX-style sockets instead. */
+    #include <sys/socket.h>
+    #include <arpa/inet.h>
+    #include <netdb.h>  /* Needed for getaddrinfo() and freeaddrinfo() */
+    #include <unistd.h> /* Needed for close() */
+    typedef int SOCKET;
+    #define INVALID_SOCKET -1
+    #define SOCKET_ERROR -1
+#endif
 #include <stdio.h>
 #include <stdint.h>
 
 #include <string>
 #include <mutex>
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
+
+
 
 #pragma comment(lib, "Ws2_32.lib")
 
@@ -60,6 +73,40 @@ std::string GetAvErrorString(int errNum)
 	char buf[1024];
 	std::string result = av_make_error_string(buf, 1024, errNum);
 	return result;
+}
+
+static bool initSocket(void) {
+#if _WIN32
+    // Initialize Winsock
+    WSADATA wsaData = { 0 };
+    int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (iResult != 0) {
+        OM_LOG(LOG_ERROR, "WSAStartup failed: %d\n", iResult);
+        return false;
+    }
+#else
+    return true;
+#endif
+}
+
+static int closeSocket(SOCKET sock) {
+    int status = 0;
+#ifdef _WIN32
+    status = closesocket(sock);
+    if(status!=0) { status = WSAGetLastError(); }
+#else
+    status = shutdown(sock, SHUT_RDWR);
+    if (status == 0) { status = close(sock); }
+#endif
+    return status;
+}
+
+static int cleanupSocket(void) {
+#if _WIN32
+    return WSACleanup();
+#else
+    return 0;
+#endif
 }
 
 class OculusMrcSource
@@ -106,18 +153,26 @@ public:
 				obs_property_t *property, void *data) {
 			return ((OculusMrcSource *)data)->ConnectClicked(props, property);
 		});
-		obs_property_set_enabled(connectButton, context->m_connectSocket == INVALID_SOCKET);
+		obs_property_set_enabled(connectButton, isSocketInvalid(context->m_connectSocket));
 
 		obs_property_t* disconnectButton = obs_properties_add_button(props, "disconnect",
 			obs_module_text("Disconnect"), [](obs_properties_t *props,
 				obs_property_t *property, void *data) {
 			return ((OculusMrcSource *)data)->DisconnectClicked(props, property);
 		});
-		obs_property_set_enabled(disconnectButton, context->m_connectSocket != INVALID_SOCKET);
+		obs_property_set_enabled(disconnectButton, !isSocketInvalid(context->m_connectSocket));
 
 		return props;
 	}
 
+    static bool isSocketInvalid(SOCKET socket) {
+#if _WIN32
+        return socket == INVALID_SOCKET;
+#else
+        return socket < 0;
+#endif
+    }
+    
 	static void VideoTick(void *data, float seconds)
 	{
 		OculusMrcSource *context = (OculusMrcSource *)data;
@@ -164,8 +219,8 @@ public:
 
 	void RefreshButtons(obs_properties_t* props)
 	{
-		obs_property_set_enabled(obs_properties_get(props, "connect"), m_connectSocket == INVALID_SOCKET);
-		obs_property_set_enabled(obs_properties_get(props, "disconnect"), m_connectSocket != INVALID_SOCKET);
+		obs_property_set_enabled(obs_properties_get(props, "connect"), isSocketInvalid(m_connectSocket));
+		obs_property_set_enabled(obs_properties_get(props, "disconnect"), !isSocketInvalid(m_connectSocket));
 	}
 
 	bool ConnectClicked(obs_properties_t* props, obs_property_t* /*property*/) {
@@ -331,7 +386,7 @@ private:
 
 	void ReceiveData()
 	{
-		if (m_connectSocket != INVALID_SOCKET)
+		if (!isSocketInvalid(m_connectSocket))
 		{
 			for (;;)
 			{
@@ -372,11 +427,11 @@ private:
 
 	void VideoTickImpl()
 	{
-		if (m_connectSocket != INVALID_SOCKET)
+		if (!isSocketInvalid(m_connectSocket))
 		{
 			ReceiveData();
 
-			if (m_connectSocket == INVALID_SOCKET)	// socket disconnected
+			if (isSocketInvalid(m_connectSocket))	// socket disconnected
 				return;
 
 			//std::chrono::time_point<std::chrono::system_clock> startTime = std::chrono::system_clock::now();
@@ -555,7 +610,7 @@ private:
 	void VideoRenderImpl()
 	{
 #if _DEBUG
-		if (m_connectSocket != INVALID_SOCKET && m_frameCollection.HasFirstFrame())
+		if (!isSocketInvalid(m_connectSocket) && m_frameCollection.HasFirstFrame())
 		{
 			std::chrono::duration<double> timePassed = std::chrono::system_clock::now() - m_frameCollection.GetFirstFrameTime();
 			OM_BLOG(LOG_DEBUG, "[%f] VideoRenderImpl", timePassed.count());
@@ -590,7 +645,7 @@ private:
 
 	void Connect()
 	{
-		if (m_connectSocket != INVALID_SOCKET)
+		if (!isSocketInvalid(m_connectSocket))
 		{
 			OM_BLOG(LOG_ERROR, "Already connected");
 			return;
@@ -613,9 +668,13 @@ private:
 
 		ptr = result;
 		m_connectSocket = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
-		if (m_connectSocket == INVALID_SOCKET)
+		if (isSocketInvalid(m_connectSocket))
 		{
+#if _WIN32
 			OM_BLOG(LOG_ERROR, "Error at socket(): %d", WSAGetLastError());
+#else
+            OM_BLOG(LOG_ERROR, "Error at socket(): %d", m_connectSocket);
+#endif
 			freeaddrinfo(result);
 		}
 
@@ -623,7 +682,7 @@ private:
 		if (iResult == SOCKET_ERROR)
 		{
 			OM_BLOG(LOG_ERROR, "Unable to connect");
-			closesocket(m_connectSocket);
+			closeSocket(m_connectSocket);
 			m_connectSocket = INVALID_SOCKET;
 		}
 
@@ -642,7 +701,7 @@ private:
 
 	void Disconnect()
 	{
-		if (m_connectSocket == INVALID_SOCKET)
+		if (isSocketInvalid(m_connectSocket))
 		{
 			OM_BLOG(LOG_ERROR, "Not connected");
 			return;
@@ -650,10 +709,10 @@ private:
 
 		StopDecoder();
 
-		int ret = closesocket(m_connectSocket);
-		if (ret == INVALID_SOCKET)
+		int ret = closeSocket(m_connectSocket);
+		if (ret!=0)
 		{
-			OM_BLOG(LOG_ERROR, "closesocket error %d", WSAGetLastError());
+			OM_BLOG(LOG_ERROR, "closesocket error %d", ret);
 		}
 		m_connectSocket = INVALID_SOCKET;
 		OM_BLOG(LOG_INFO, "Socket disconnected");
@@ -670,13 +729,7 @@ MODULE_EXPORT const char *obs_module_description(void)
 
 bool obs_module_load(void)
 {
-	// Initialize Winsock
-	WSADATA wsaData = { 0 };
-	int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
-	if (iResult != 0) {
-		OM_LOG(LOG_ERROR, "WSAStartup failed: %d\n", iResult);
-		return false;
-	}
+    if(!initSocket()) return false;
 
 	struct obs_source_info oculus_mrc_source_info = { 0 };
 	oculus_mrc_source_info.id = "oculus_mrc_source";
@@ -699,5 +752,5 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
-	WSACleanup();
+    cleanupSocket();
 }
